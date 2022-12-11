@@ -1,0 +1,355 @@
+#include "cache.h"
+
+#define IP_TRACKER_COUNT 1024
+#define DPT_SIZE 4096
+#define GHB_SIZE 16
+
+#define CLASS_GS 0
+#define CLASS_CS 1
+#define CLASS_CPLX 2
+#define CLASS_NL 3
+
+//测试专用
+#define GS_ON true
+#define CS_ON true
+#define CPLX_ON true
+#define NL_ON true
+
+int PREFETCH_DEGREE;           //for CS & CPLX only
+int GS_PREFETCH_DEGREE;
+
+int SPEC_NL_THRESHOLD;
+uint64_t miss_counter[NUM_CPUS] = {0};
+uint64_t prev_cpu_cycle[NUM_CPUS];
+bool spec_nl[NUM_CPUS] = {0};
+
+int ghb_tail[NUM_CPUS] = {0};               //GHB插入位置（FIFO队尾）
+
+class IP_TRACKER {
+  public:
+    //CS专用
+    uint8_t ip_tag;//6 bits
+    bool ip_valid;
+    uint64_t page_no;
+    int8_t page_offset;
+    int8_t last_stride;
+    uint8_t cs_conf;//2 bits，为2或3时预取
+
+    //CPLX专用
+    uint16_t sig;//12 bits, new_signature = (old_signature<<1)^stride
+    
+    //IP_GS专用
+    bool str_valid;
+    bool str_direction;//1为正向，0为负向
+    bool str_strength;
+
+    IP_TRACKER () {
+        ip_tag = 0;
+        ip_valid = 0;
+        page_no = 0;
+        page_offset = 0;
+        last_stride = 0;
+        cs_conf = 0;
+        sig = 0;
+        str_valid = 0;
+        str_direction = 0;
+        str_strength = 0;
+    };
+};
+
+class DPT_ENTRY {
+public:
+    int8_t stride;//7 bits
+    uint8_t conf;//2 bits
+
+    DPT_ENTRY () {
+        stride = 0;
+        conf = 0;
+    };        
+};
+
+//structure of metadata
+//      +------------------+--------------+---------+
+//      |      stride      |  class_type  | SPEC_NL |
+//      |      8 bits      |    3 bits    |  1 bit  |
+//      +------------------+--------------+---------+
+uint32_t make_metadata(int8_t stride, uint8_t class_type, bool spec_nl){
+    uint32_t metadata = stride;
+    metadata <<= 4;
+    metadata |= (class_type << 1);
+    metadata |= spec_nl;
+    return metadata;
+}
+
+IP_TRACKER trackers_l1[NUM_CPUS][IP_TRACKER_COUNT];
+DPT_ENTRY DPT_l1[NUM_CPUS][DPT_SIZE];
+uint64_t GHB_l1[NUM_CPUS][GHB_SIZE];
+
+void CACHE::l1d_prefetcher_initialize() 
+{
+    if(NUM_CPUS == 1){
+        PREFETCH_DEGREE = 3;
+        GS_PREFETCH_DEGREE = 6;
+        SPEC_NL_THRESHOLD = 15;
+    }
+    else{
+        PREFETCH_DEGREE = 2;
+        GS_PREFETCH_DEGREE = 4;
+        SPEC_NL_THRESHOLD = 5;
+    }
+    memcpy(prev_cpu_cycle, current_core_cycle, NUM_CPUS * sizeof(uint64_t));
+    cout << "CPU " << cpu << " L1D IPCP prefetcher" << endl;
+}
+
+void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type)
+{
+    //在CPLX中，即使被归为该类也可能因置信度不够而未发生预取
+    //判定是否需要next line，每当预取时设置为true
+    bool fetched = false;
+
+    //STEP0：更新MPKC（miss per kilo cycles）、SPEC_NL=========================================
+    //未命中，计数器累加
+    if(!cache_hit){
+        miss_counter[cpu]++;
+        //计数器达到256，计算MPCK
+        if(miss_counter[cpu]==256){
+            float mpkc = miss_counter[cpu] * 1000.0 / (current_core_cycle[cpu] - prev_cpu_cycle[cpu]);
+            //缺失率过高，关闭next line防止污染
+            if(mpkc>SPEC_NL_THRESHOLD){
+                spec_nl[cpu] = 0;
+            }
+            else{
+                spec_nl[cpu] = 1;
+            }
+            //更新miss_counter及prev_cpu_cycle
+            miss_counter[cpu] = 0;
+            prev_cpu_cycle[cpu] = current_core_cycle[cpu];
+        }
+    }
+
+    //STEP1: 查找IP_TRACKER项，插入新项或更新IP_valid============================================
+    //出于性能考虑，tracker table采用直相连而非全相联+LRU
+    uint64_t index = ip % IP_TRACKER_COUNT;
+    uint8_t tag = ip / IP_TRACKER_COUNT;
+    uint64_t cur_page = addr >> LOG2_PAGE_SIZE;
+    uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
+    int8_t cur_offset = cl_addr & 0x3F;//6 bits, [0, 63]
+    if(trackers_l1[cpu][index].ip_tag!=tag){
+        //IPA: V=1, IPB mapped to same entry: V=0
+        if(trackers_l1[cpu][index].ip_valid){
+            trackers_l1[cpu][index].ip_valid = 0;
+        }
+        //If V=0 but IP_tag is different then clear the entry and make confidence zero
+        else{
+            trackers_l1[cpu][index].ip_tag = tag;
+            trackers_l1[cpu][index].page_no = cur_page;
+            trackers_l1[cpu][index].page_offset = cur_offset;
+            trackers_l1[cpu][index].last_stride = 0;//stride初始化为0
+            trackers_l1[cpu][index].sig = 0;//sig初始化为0
+            trackers_l1[cpu][index].cs_conf = 0;
+            trackers_l1[cpu][index].str_valid = 0;
+            trackers_l1[cpu][index].str_strength = 0;
+            trackers_l1[cpu][index].str_direction = 0;
+            trackers_l1[cpu][index].ip_valid = 1;
+        }
+        //当遇到新IP时，不属于任何类，触发next line策略
+        if(NL_ON){
+            uint64_t pf_address = (cl_addr + 1) << LOG2_BLOCK_SIZE;
+            uint64_t metadata = make_metadata(1, CLASS_NL, spec_nl[cpu]);
+            prefetch_line(ip, addr, pf_address, FILL_L1, metadata);
+            return;
+        }
+    }
+    //IPA: V=0: IPA mapped to same entry: V=1
+    else{
+        trackers_l1[cpu][index].ip_valid = 1;
+    }
+
+    //STEP2：(CS)更新stride、cs_conf===============================================================
+    // 均为有符号数
+    int8_t stride = cur_offset - trackers_l1[cpu][index].page_offset;
+    // don't do anything if we somehow saw the same address twice in a row
+    if (stride == 0)
+        return;
+    // page boundary learning
+    if(cur_page != trackers_l1[cpu][index].page_no){
+        if(stride < 0){
+            stride += 64;
+        }
+        else{
+            stride -= 64;
+        }
+    }
+    //更新饱和计数器cs_conf，然后才能根据cs_conf的值确定是否更新stride或归为CS类
+    //stride相同，confidence++
+    if(stride == trackers_l1[cpu][index].last_stride){
+        //不要加爆了
+        if(trackers_l1[cpu][index].cs_conf < 3){
+            trackers_l1[cpu][index].cs_conf++;
+        }
+    }
+    //stride不同，confidence--
+    //不要减过了
+    else if(trackers_l1[cpu][index].cs_conf > 0){
+        trackers_l1[cpu][index].cs_conf--;
+    }
+    //仅当confidence为0（完全失效，容忍2条）时更新stride
+    if(trackers_l1[cpu][index].cs_conf == 0){
+        trackers_l1[cpu][index].last_stride = stride;
+    }
+
+    //STEP3: (CPLX)更新sig、conf===================================================================
+    uint16_t last_sig = trackers_l1[cpu][index].sig;
+    //3-1：根据cl_addr结果，先更新DPT entry的conf
+    //DPT预测正确，confidence++
+    if(stride == DPT_l1[cpu][last_sig].stride){
+        if(DPT_l1[cpu][last_sig].conf < 3){
+            DPT_l1[cpu][last_sig].conf++;
+        }
+    }
+    //stride不同，DPT预测错误，confidence--
+    else if(DPT_l1[cpu][last_sig].conf > 0){
+        DPT_l1[cpu][last_sig].conf--;
+    }
+    //仅当confidence为0（完全失效，容忍2条）时更新stride
+    if(DPT_l1[cpu][last_sig].conf == 0){
+        DPT_l1[cpu][last_sig].stride = stride;
+    }
+    //3-2：更新trackers表中的sig
+    //此处与原实现不同
+    //sig_delta = (delta < 0) ? (((-1) * delta) + (1 << 6)) : delta;
+    int8_t delta = DPT_l1[cpu][last_sig].stride & 0x7F;//截取7位
+    trackers_l1[cpu][index].sig = ((last_sig << 1) ^ delta) & 0xFFF;
+
+    //STEP4: 更新str_valid/str_direction/str_strength/GHB===========================================
+    //4-1: 统计满足递增和递减模式的数量
+    int ascending = 0;
+    int descending = 0;
+    int count = 0;//最长方向长度
+    for(int i = 0;i<GHB_SIZE; i++){
+        //历史记录GHB[cpu][i]位于[cl_addr-GHB_SIZE, cl_addr)，为递增样本
+        if(GHB_l1[cpu][i] < cl_addr && GHB_l1[cpu][i] >= cl_addr - GHB_SIZE){
+            ascending++;
+        }
+        //历史记录GHB[cpu][i]位于(cl_addr, cl_addr-GHB_SIZE]，为递减样本
+        if(GHB_l1[cpu][i] > cl_addr && GHB_l1[cpu][i] <= cl_addr + GHB_SIZE){
+            descending++;
+        }
+    }
+    //4-2：投票判定方向
+    if(ascending > descending){
+        trackers_l1[cpu][index].str_direction = 1;
+        count = ascending;
+    }
+    else{
+        trackers_l1[cpu][index].str_direction = 0;
+        count = descending;
+    }
+    //4-3：当该方向记录数超过一半时，认为临时属于GS: valid=1, strength=0
+    if(count > GHB_SIZE/2){
+        trackers_l1[cpu][index].str_valid = 1;
+        //当该方向记录数超过3/4时，认为永久属于GS，strength=1
+        if(count >= GHB_SIZE*3/4){
+            trackers_l1[cpu][index].str_strength = 1;
+        }
+        else{
+            trackers_l1[cpu][index].str_strength = 0;
+        }
+    }
+    //若未超过一半，且不是永久GS，取消流认定，重置valid
+    else if(trackers_l1[cpu][index].str_strength == 0){
+        trackers_l1[cpu][index].str_valid = 0;
+    }
+    //4-4：添加GHB项
+    //首先查找有无重复
+    bool dup = false;
+    for(int i = 0;i<GHB_SIZE; i++){
+        if(GHB_l1[cpu][i]==cl_addr){
+            dup = true;
+            break;
+        }
+    }
+    //无重复，插入新ghb项
+    if(!dup){
+        GHB_l1[cpu][ghb_tail[cpu]] = cl_addr;
+        ghb_tail[cpu] = (ghb_tail[cpu] + 1) % GHB_SIZE;
+    }
+    //==========================至此，除page_no和page_offset外的全部更新工作完成=========================
+    //STEP5: 检查是否为GS==============================================================================
+    //判断方法：str_valid==1
+    if(GS_ON && trackers_l1[cpu][index].str_valid == 1){
+        int direction;
+        if(trackers_l1[cpu][index].str_direction){//正向
+            direction = 1;
+        }
+        else{
+            direction = -1;//负向
+        }
+        for(int i = 1;i<=GS_PREFETCH_DEGREE; i++){
+            uint64_t pf_address = (cl_addr + i * direction) << LOG2_BLOCK_SIZE;
+            // only issue a prefetch if the prefetch address is in the same 4 KB page 
+            // as the current demand access address
+            if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
+                break;
+            uint32_t metadata = make_metadata(direction, CLASS_GS, spec_nl[cpu]);
+            prefetch_line(ip, addr, pf_address, FILL_L1, metadata);
+            fetched = true;
+        }
+    }
+    //STEP6: 检查是否为CS===============================================================================
+    //判断方法：cs_conf>1，且stride不为0
+    else if(CS_ON && trackers_l1[cpu][index].cs_conf>1 && trackers_l1[cpu][index].last_stride != 0){
+        for(int i = 0;i < PREFETCH_DEGREE; i++){
+            uint64_t pf_address = (cl_addr + (i + 1) * trackers_l1[cpu][index].last_stride) << LOG2_BLOCK_SIZE;
+            if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
+                break;
+            uint32_t metadata = make_metadata(trackers_l1[cpu][index].last_stride, CLASS_GS, spec_nl[cpu]);
+            prefetch_line(ip, addr, pf_address, FILL_L1, metadata);
+            fetched = true;
+        }
+    }
+    //STEP7：判定为CPLX
+    else if(CPLX_ON && DPT_l1[cpu][trackers_l1[cpu][index].sig].stride != 0){
+        uint16_t cur_sig = trackers_l1[cpu][index].sig;
+        uint64_t pf_address = cl_addr << LOG2_BLOCK_SIZE;
+        for(int i = 0;i<PREFETCH_DEGREE; i++){
+            pf_address += ((int)DPT_l1[cpu][cur_sig].stride << LOG2_BLOCK_SIZE);
+            //跨页，或conf为0，或DPT项未初始化，结束预取
+            if (((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE)) || 
+                (DPT_l1[cpu][cur_sig].conf == 0) ||//此处原实现取-1
+                (DPT_l1[cpu][cur_sig].stride == 0))
+                break;
+            if(DPT_l1[cpu][cur_sig].conf > 1){//此处原实现取0
+                uint32_t metadata = make_metadata(0, CLASS_CPLX, spec_nl[cpu]);
+                prefetch_line(ip, addr, pf_address, FILL_L1, metadata);
+                fetched = true;
+            }
+            //更新cur_sig
+            //此处与原实现不同
+            //sig_delta = (delta < 0) ? (((-1) * delta) + (1 << 6)) : delta;
+            int8_t delta = DPT_l1[cpu][cur_sig].stride & 0x7F;//截取7位
+            cur_sig = ((cur_sig << 1) ^ delta) & 0xFFF;
+        }
+    }
+
+    //若以上均不满足，且NL为ON，触发next line
+    if(NL_ON && !fetched && spec_nl[cpu]){
+        uint64_t pf_address = (cl_addr + 1) << LOG2_BLOCK_SIZE;  
+        uint64_t metadata = make_metadata(1, CLASS_NL, spec_nl[cpu]);
+        prefetch_line(ip, addr, pf_address, FILL_L1, metadata);
+    }
+    //更新IP_TRACKER项
+    trackers_l1[cpu][index].page_no = cur_page;
+    trackers_l1[cpu][index].page_offset = cur_offset;
+
+}
+
+void CACHE::l1d_prefetcher_cache_fill(uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t evicted_addr, uint32_t metadata_in)
+{
+
+}
+
+void CACHE::l1d_prefetcher_final_stats()
+{
+    cout << "CPU " << cpu << " L1D IPCP prefetcher final stats" << endl;
+}

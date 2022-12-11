@@ -9,8 +9,8 @@ fi
 
 # ChampSim configuration
 #BRANCH=$1           # branch/*.bpred
-#L1D_PREFETCHER=$1   # prefetcher/*.l1d_pref
-L2C_PREFETCHER=$1   # prefetcher/*.l2c_pref
+L1D_PREFETCHER=$1   # prefetcher/*.l1d_pref
+# L2C_PREFETCHER=$1   # prefetcher/*.l2c_pref
 #LLC_PREFETCHER=$3   # prefetcher/*.llc_pref
 #LLC_REPLACEMENT=$5  # replacement/*.llc_repl
 #NUM_CORE=$6         # tested up to 8-core system
@@ -22,9 +22,10 @@ NORMAL=$(tput sgr0)
 
 ############## Default configuration ############
 BRANCH=perceptron
-L1D_PREFETCHER=no
+# L1D_PREFETCHER=no
+L2C_PREFETCHER=GHB
 LLC_PREFETCHER=no
-LLC_REPLACEMENT=lru
+LLC_REPLACEMENT=ship
 NUM_CORE=1
 #################################################
 

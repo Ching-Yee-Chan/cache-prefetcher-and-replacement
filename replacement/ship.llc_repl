@@ -3,12 +3,12 @@
 #include <ctime>
 
 #define maxRRPV 3
-#define SHCT_SIZE  16384
+#define SHCT_SIZE  16384    //14-bit signature index
 #define SHCT_PRIME 16381
 #define SAMPLER_SET (256*NUM_CPUS)
 #define SAMPLER_WAY LLC_WAY
 #define SHCT_MAX 7
-
+//re-reference prediction values, [0, 3]
 uint32_t rrpv[LLC_SET][LLC_WAY];
 
 // sampler structure
@@ -17,9 +17,9 @@ class SAMPLER_class
   public:
     uint8_t valid,
             type,
-            used;
+            used;   //outcome bit
 
-    uint64_t tag, cl_addr, ip;
+    uint64_t tag, cl_addr, ip;//signature: SHiP-Mem/SHiP-PC
     
     uint32_t lru;
 
@@ -49,7 +49,7 @@ class SHCT_class {
         counter = 0;
     };
 };
-SHCT_class SHCT[NUM_CPUS][SHCT_SIZE];
+SHCT_class SHCT[NUM_CPUS][SHCT_SIZE];//记录miss次数
 
 // initialize replacement state
 void CACHE::llc_initialize_replacement()
@@ -118,7 +118,7 @@ void update_sampler(uint32_t cpu, uint32_t s_idx, uint64_t address, uint64_t ip,
     {
         if (s_set[match].valid && (s_set[match].tag == tag))
         {
-            uint32_t SHCT_idx = s_set[match].ip % SHCT_PRIME;
+            uint32_t SHCT_idx = s_set[match].ip % SHCT_PRIME;//IP signature
             if (SHCT[cpu][SHCT_idx].counter > 0)
                 SHCT[cpu][SHCT_idx].counter--;
 
@@ -249,7 +249,7 @@ void CACHE::llc_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
     if (type == WRITEBACK) {
         if (hit)
             return;
-        else {
+        else {  //换入，且为distant
             rrpv[set][way] = maxRRPV-1;
             return;
         }
@@ -257,9 +257,9 @@ void CACHE::llc_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
 
     // update sampler
     uint32_t s_idx = is_it_sampled(set);
-    if (s_idx < SAMPLER_SET)
+    if (s_idx < SAMPLER_SET)//仅更新采样set内的block的SHCT
         update_sampler(cpu, s_idx, full_addr, ip, type);
-
+    //命中，更新rrpv为near
     if (hit)
         rrpv[set][way] = 0;
     else {
@@ -269,9 +269,9 @@ void CACHE::llc_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
         // sanity check
         if (SHCT_idx >= SHCT_PRIME)
             assert(0);
-
+        //换入，更新rrpv为distant（没有被sample set覆盖到的cache block一定会走到这里）
         rrpv[set][way] = maxRRPV-1;
-        if (SHCT[cpu][SHCT_idx].counter == SHCT_MAX)
+        if (SHCT[cpu][SHCT_idx].counter == SHCT_MAX)//如果counter达到最大，设为最远
             rrpv[set][way] = maxRRPV;
     }
 }
