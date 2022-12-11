@@ -4,3 +4,4 @@ prefetcher/IPCP_ref.l1d_pref
 bin
 traces
 prefetcher/IPCP.cc
+results_100M

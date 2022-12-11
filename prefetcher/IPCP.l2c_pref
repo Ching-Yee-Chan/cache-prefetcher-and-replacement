@@ -1,0 +1,145 @@
+#include "cache.h"
+//注意防止变量名冲突
+#define IP_TRACKER_COUNT 1024
+
+#define CLASS_GS 0
+#define CLASS_CS 1
+#define CLASS_CPLX 2
+#define CLASS_NL 3
+
+//测试专用
+#define GS_ON true
+#define CS_ON true
+//无CPLX
+#define NL_ON true
+
+int PREFETCH_DEGREE_GS;
+int PREFETCH_DEGREE_CS;
+
+bool spec_nl_l2[NUM_CPUS] = {0};
+
+class IP_TRACKER {
+  public:
+    uint8_t ip_tag;//6 bits
+    bool ip_valid;
+    int8_t pref_type;//3 bits, [0, 3]
+    int8_t stride;
+
+    IP_TRACKER () {
+        ip_tag = 0;
+        ip_valid = 0;
+        pref_type = -1;
+        stride = 0;
+    };
+};
+
+IP_TRACKER trackers_l2[NUM_CPUS][IP_TRACKER_COUNT];
+
+void CACHE::l2c_prefetcher_initialize() 
+{
+    if(NUM_CPUS == 1){
+        PREFETCH_DEGREE_GS = 4;
+        if (MSHR.occupancy < (MSHR.SIZE>>1)){
+            PREFETCH_DEGREE_CS = 4;
+        }
+        else{
+            PREFETCH_DEGREE_CS = 3;
+        }
+    }
+    else{
+        PREFETCH_DEGREE_GS = 2;
+        PREFETCH_DEGREE_CS = 2;
+    }
+    cout << "CPU " << cpu << " L2C IPCP prefetcher" << endl;
+}
+
+uint32_t CACHE::l2c_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint32_t metadata_in)
+{
+    //STEP1: 查找IP_TRACKER项，插入新项或更新IP_valid============================================
+    //出于性能考虑，tracker table采用直相连而非全相联+LRU
+
+    uint64_t index = ip % IP_TRACKER_COUNT;
+    uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
+    uint8_t tag = ip / IP_TRACKER_COUNT;
+
+    //structure of metadata
+    //      +------------------+--------------+---------+
+    //      |      stride      |  class_type  | SPEC_NL |
+    //      |      8 bits      |    3 bits    |  1 bit  |
+    //      +------------------+--------------+---------+
+    
+    int8_t stride = metadata_in >> 4;
+    int8_t pref_type = (metadata_in & 0xE) >> 1;
+    if(trackers_l2[cpu][index].ip_tag!=tag){
+        //IPA: V=1, IPB mapped to same entry: V=0
+        if(trackers_l2[cpu][index].ip_valid){
+            trackers_l2[cpu][index].ip_valid = 0;
+        }
+        //If V=0 but IP_tag is different then clear the entry and make confidence zero
+        else{
+            trackers_l2[cpu][index].ip_tag = tag;
+            // ip_valid保持为0，直至再次命中
+            // trackers_l2[cpu][index].pref_type = pref_type;
+            // trackers_l2[cpu][index].stride = stride;
+        }
+        //当遇到新IP时，不属于任何类，触发next line策略
+        if(NL_ON){
+            uint64_t pf_address = (cl_addr + 1) << LOG2_BLOCK_SIZE;
+            prefetch_line(ip, addr, pf_address, FILL_L2, 0);
+            return metadata_in;
+        }
+    }
+    //IPA: V=0: IPA mapped to same entry: V=1
+    else{
+        trackers_l2[cpu][index].ip_valid = 1;
+    }
+
+    //STEP2：仅当类型为PREFETCH时，metadata才有效，这是更新trackers表的唯一途径=================================
+    if(type == PREFETCH){
+        trackers_l2[cpu][index].pref_type = pref_type;
+        trackers_l2[cpu][index].stride = stride;
+        spec_nl_l2[cpu] = metadata_in & 0x1;
+    }
+
+    //STEP3: GS和CS处理方法完全相同，仅深度不同================================================================
+    if(GS_ON && trackers_l2[cpu][index].pref_type==CLASS_GS){
+        if(trackers_l2[cpu][index].stride != 0){
+            for(int i = 1;i<=PREFETCH_DEGREE_GS; i++){
+                uint64_t pf_address = (cl_addr + i * trackers_l2[cpu][index].stride) << LOG2_BLOCK_SIZE;
+                // only issue a prefetch if the prefetch address is in the same 4 KB page 
+                // as the current demand access address
+                if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
+                    break;
+                prefetch_line(ip, addr, pf_address, FILL_L2, 0);
+            }
+        }
+    }
+    else if (CS_ON && trackers_l2[cpu][index].pref_type==CLASS_CS){
+        if(trackers_l2[cpu][index].stride != 0){
+            for(int i = 1;i<=PREFETCH_DEGREE_CS; i++){
+                uint64_t pf_address = (cl_addr + i * trackers_l2[cpu][index].stride) << LOG2_BLOCK_SIZE;
+                // only issue a prefetch if the prefetch address is in the same 4 KB page 
+                // as the current demand access address
+                if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
+                    break;
+                prefetch_line(ip, addr, pf_address, FILL_L2, 0);
+            }
+        }
+    }
+    //STEP4: 检查是否为NL===============================================================================
+    else if(NL_ON && trackers_l2[cpu][index].pref_type==CLASS_NL && spec_nl_l2[cpu]){
+        uint64_t pf_address = (cl_addr + 1) << LOG2_BLOCK_SIZE;  
+        prefetch_line(ip, addr, pf_address, FILL_L2, 0);
+    }
+    return metadata_in;
+}
+
+uint32_t CACHE::l2c_prefetcher_cache_fill(uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t evicted_addr, uint32_t metadata_in)
+{
+    return metadata_in;
+}
+
+void CACHE::l2c_prefetcher_final_stats()
+{
+    cout << "CPU " << cpu << " L2C IPCP prefetcher final stats" << endl;
+}
