@@ -25,7 +25,7 @@ BRANCH=perceptron
 # L1D_PREFETCHER=no
 L2C_PREFETCHER=GHB
 LLC_PREFETCHER=no
-LLC_REPLACEMENT=ship
+LLC_REPLACEMENT=ship++
 NUM_CORE=1
 #################################################
 

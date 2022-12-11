@@ -1,0 +1,6 @@
+prefetcher/GHB_ref.l2c_pref
+prefetcher/IPCP_ref.l2c_pref
+prefetcher/IPCP_ref.l1d_pref
+bin
+traces
+prefetcher/IPCP.cc
