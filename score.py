@@ -36,7 +36,7 @@ for path,d,filelist in os.walk(trace_file_path):
 cmd = "./run_champsim.sh " + bin_path + " 50 100 "
 
 print("please wait...")
-student_num = "results_100M/no-no-no"
+student_num = "results_100M/IPCP-GHB-no-ship++"
 log_num = 0
 for trace in traces:
     trace_cmd = cmd + trace + "> " + student_num + "_" + str(log_num)

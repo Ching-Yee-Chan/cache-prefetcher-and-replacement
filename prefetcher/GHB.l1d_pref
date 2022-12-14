@@ -1,0 +1,101 @@
+#include "cache.h"
+
+#define IT_SIZE 256
+#define GHB_SIZE 256
+#define PREFETCH_LOOKAHEAD 4
+#define PREFETCH_DEGREE 4
+
+//由于需要分辨未初始化的IT entry，需要使用int16_t类型
+int16_t IT_l1[IT_SIZE] = {0};
+struct ghb_entry{
+  uint64_t cl_addr;
+	int16_t prev_ptr;
+}GHB_l1[GHB_SIZE];
+//GHB队尾（空位）
+int16_t tail_l1 = 0;
+
+void CACHE::l1d_prefetcher_initialize() 
+{
+    cout << "CPU " << cpu << " L2C GHB prefetcher" << endl;
+    //指针为-1表示未初始化
+    for (int i=0; i<IT_SIZE; i++)
+        IT_l1[i] = -1;
+    for (int i=0; i<GHB_SIZE; i++){
+      GHB_l1[i].cl_addr = 0;
+      GHB_l1[i].prev_ptr = -1;
+    }
+}
+
+void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type)
+{
+    uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
+    int IT_index = ip % IT_SIZE;
+    //若队列满，出队
+    for(int i = 0; i < IT_SIZE; i++){
+      //清除指向该项的IT entry
+      if(IT_l1[i]==tail_l1){
+        IT_l1[i] = -1;
+      }
+      //将指向该项的GHB entry指针置为-1
+      if(GHB_l1[i].prev_ptr==tail_l1){
+        GHB_l1[i].prev_ptr =-1;
+      }
+    }
+    //将cl_addr加入GHB
+    GHB_l1[tail_l1].cl_addr = cl_addr;
+    GHB_l1[tail_l1].prev_ptr = IT_l1[IT_index];
+    IT_l1[IT_index] = tail_l1;
+    //获取上3次访问地址
+    uint64_t last_three_cl_addr[3];
+    int16_t ghb_index = tail_l1;
+    tail_l1 = (tail_l1 + 1) % GHB_SIZE;
+    for(int i = 0;i<3;i++){
+      //记录不足3条，直接退出
+      if(ghb_index == -1){
+        return;
+      }
+      last_three_cl_addr[i] = GHB_l1[ghb_index].cl_addr;
+      ghb_index = GHB_l1[ghb_index].prev_ptr;
+    }
+    int64_t stride1 = 0;
+    if (last_three_cl_addr[0] >= last_three_cl_addr[1])
+        stride1 = last_three_cl_addr[0] - last_three_cl_addr[1];
+    else {
+        stride1 = last_three_cl_addr[1] - last_three_cl_addr[0];
+        stride1 *= -1;
+    }
+    int64_t stride2 = 0;
+    if (last_three_cl_addr[1] >= last_three_cl_addr[2])
+        stride2 = last_three_cl_addr[1] - last_three_cl_addr[2];
+    else {
+        stride2 = last_three_cl_addr[2] - last_three_cl_addr[1];
+        stride2 *= -1;
+    }
+    if(stride2==stride1){
+        // do some prefetching
+        for (int i=0; i<PREFETCH_DEGREE; i++) {
+            uint64_t pf_address = (cl_addr + PREFETCH_LOOKAHEAD * (stride1*(i+1))) << LOG2_BLOCK_SIZE;
+
+            // only issue a prefetch if the prefetch address is in the same 4 KB page 
+            // as the current demand access address
+            if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
+                break;
+
+            // check the MSHR occupancy to decide if we're going to prefetch to the L2 or LLC
+            if (MSHR.occupancy < (MSHR.SIZE>>1))
+	      prefetch_line(ip, addr, pf_address, FILL_L2, 0);
+            else
+	      prefetch_line(ip, addr, pf_address, FILL_LLC, 0);
+        }
+    }
+}
+
+void CACHE::l1d_prefetcher_cache_fill(uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t evicted_addr, uint32_t metadata_in)
+{
+
+}
+
+void CACHE::l1d_prefetcher_final_stats()
+{
+
+}
